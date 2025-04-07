@@ -53,71 +53,156 @@ function removeFromQueue(socketId) {
 
 function updateQueuePositions() {
   queue.forEach((player, index) => {
-    io.to(player.socketId).emit("queueUpdate", {
-      position: index + 1,
-      totalPlayers: queue.length,
-      estimatedWaitTime: calculateWaitTime(index + 1),
-    });
+    if (io.sockets.sockets.has(player.socketId)) {
+      io.to(player.socketId).emit("queueUpdate", {
+        position: index + 1,
+        totalPlayers: queue.length,
+        estimatedWaitTime: calculateWaitTime(index + 1),
+      });
+    }
   });
 }
 
 function calculateWaitTime(position) {
-  // Simple estimation: average 30 seconds per position
-  return position * 30;
+  return position * 30; // 30 seconds per position
 }
 
-function checkForMatch() {
+function verifyPlayersConnected(socketId1, socketId2) {
+  return io.sockets.sockets.has(socketId1) && io.sockets.sockets.has(socketId2);
+}
+
+async function checkForMatch() {
   if (queue.length >= 2) {
-    const [player1, player2] = queue.splice(0, 2);
+    const player1 = queue[0];
+    const player2 = queue[1];
+
+    // Verify both players are still connected
+    if (!verifyPlayersConnected(player1.socketId, player2.socketId)) {
+      // Clean up disconnected players
+      if (!io.sockets.sockets.has(player1.socketId)) {
+        removeFromQueue(player1.socketId);
+        connectedPlayers.delete(player1.socketId);
+      }
+      if (!io.sockets.sockets.has(player2.socketId)) {
+        removeFromQueue(player2.socketId);
+        connectedPlayers.delete(player2.socketId);
+      }
+      return;
+    }
+
+    // Remove from queue
+    queue.shift();
+    queue.shift();
 
     // Set opponents
     player1.opponent = player2;
     player2.opponent = player1;
-
-    // Update connected players
     connectedPlayers.set(player1.socketId, player1);
     connectedPlayers.set(player2.socketId, player2);
 
     // Create match record
-    const matchId = `${player1.socketId}-${player2.socketId}-${Date.now()}`;
+    const matchId = `match-${Date.now()}-${Math.random()
+      .toString(36)
+      .substr(2, 8)}`;
     activeMatches.set(matchId, {
       players: [player1, player2],
       startedAt: new Date().toISOString(),
+      lastActivity: Date.now(),
     });
 
-    // Notify players
-    io.to(player1.socketId).emit("matchFound", {
-      matchId,
-      opponent: {
-        username: player2.username,
-        rating: player2.rating,
-        stats: player2.stats,
-      },
-    });
+    try {
+      // Notify both players with acknowledgement
+      await Promise.all([
+        new Promise((resolve, reject) => {
+          io.to(player1.socketId)
+            .timeout(5000)
+            .emit(
+              "matchFound",
+              {
+                matchId,
+                opponent: {
+                  username: player2.username,
+                  rating: player2.rating,
+                  stats: player2.stats,
+                },
+              },
+              (err) => {
+                if (err) reject(`Player1 notification failed: ${err}`);
+                else resolve();
+              }
+            );
+        }),
+        new Promise((resolve, reject) => {
+          io.to(player2.socketId)
+            .timeout(5000)
+            .emit(
+              "matchFound",
+              {
+                matchId,
+                opponent: {
+                  username: player1.username,
+                  rating: player1.rating,
+                  stats: player1.stats,
+                },
+              },
+              (err) => {
+                if (err) reject(`Player2 notification failed: ${err}`);
+                else resolve();
+              }
+            );
+        }),
+      ]);
 
-    io.to(player2.socketId).emit("matchFound", {
-      matchId,
-      opponent: {
-        username: player1.username,
-        rating: player1.rating,
-        stats: player1.stats,
-      },
-    });
-
-    updateQueuePositions();
+      updateQueuePositions();
+    } catch (error) {
+      console.error("Match setup failed:", error);
+      handleFailedMatch(player1, player2);
+    }
   }
+}
+
+function handleFailedMatch(player1, player2) {
+  // Clean up references
+  connectedPlayers.delete(player1.socketId);
+  connectedPlayers.delete(player2.socketId);
+
+  // Put players back in queue if they're still connected
+  if (io.sockets.sockets.has(player1.socketId)) {
+    queue.unshift(player1);
+    io.to(player1.socketId).emit(
+      "matchFailed",
+      "Connection issue with opponent"
+    );
+  }
+  if (io.sockets.sockets.has(player2.socketId)) {
+    queue.unshift(player2);
+    io.to(player2.socketId).emit(
+      "matchFailed",
+      "Connection issue with opponent"
+    );
+  }
+
+  updateQueuePositions();
 }
 
 function cleanupMatch(socketId) {
   const player = connectedPlayers.get(socketId);
-  if (player && player.opponent) {
+  if (!player) return;
+
+  if (player.opponent) {
     const opponent = connectedPlayers.get(player.opponent.socketId);
     if (opponent) {
-      io.to(opponent.socketId).emit("opponentLeft");
+      // Clear opponent's reference
       opponent.opponent = null;
+      connectedPlayers.set(opponent.socketId, opponent);
+
+      // Notify opponent
+      if (io.sockets.sockets.has(opponent.socketId)) {
+        io.to(opponent.socketId).emit("opponentLeft");
+      }
     }
 
-    // Remove match from active matches
+    // Remove from active matches
     for (const [matchId, match] of activeMatches.entries()) {
       if (match.players.some((p) => p.socketId === socketId)) {
         activeMatches.delete(matchId);
@@ -153,25 +238,40 @@ io.on("connection", (socket) => {
   );
 
   // Heartbeat mechanism
-  socket.on("ping", (cb) => cb());
-
-  socket.on("joinQueue", (playerData) => {
-    if (!playerData.username || !playerData.rating) {
-      return socket.emit("error", "Missing required player data");
+  const heartbeatInterval = setInterval(() => {
+    if (socket.connected) {
+      socket.emit("ping");
     }
+  }, 10000);
 
-    const player = {
-      socketId: socket.id,
-      joinedAt: new Date().toISOString(),
-      ...playerData,
-    };
+  socket.on("pong", () => {
+    // Connection is alive
+  });
 
-    removeFromQueue(socket.id);
-    queue.push(player);
-    connectedPlayers.set(socket.id, player);
+  socket.on("joinQueue", (playerData, callback) => {
+    try {
+      if (!playerData?.username || !playerData?.rating) {
+        throw new Error("Missing required player data");
+      }
 
-    updateQueuePositions();
-    checkForMatch();
+      const player = {
+        socketId: socket.id,
+        joinedAt: new Date().toISOString(),
+        ...playerData,
+      };
+
+      removeFromQueue(socket.id);
+      queue.push(player);
+      connectedPlayers.set(socket.id, player);
+
+      updateQueuePositions();
+      checkForMatch();
+
+      callback({ success: true });
+    } catch (error) {
+      console.error("Join queue error:", error.message);
+      callback({ success: false, error: error.message });
+    }
   });
 
   socket.on("leaveQueue", () => {
@@ -182,7 +282,7 @@ io.on("connection", (socket) => {
 
   socket.on("pokemonSelected", (data) => {
     const player = connectedPlayers.get(socket.id);
-    if (player?.opponent) {
+    if (player?.opponent && io.sockets.sockets.has(player.opponent.socketId)) {
       io.to(player.opponent.socketId).emit("pokemonSelected", {
         ...data,
         username: player.username,
@@ -192,7 +292,7 @@ io.on("connection", (socket) => {
 
   socket.on("attack", (data) => {
     const player = connectedPlayers.get(socket.id);
-    if (player?.opponent) {
+    if (player?.opponent && io.sockets.sockets.has(player.opponent.socketId)) {
       io.to(player.opponent.socketId).emit("attackPerformed", {
         ...data,
         username: player.username,
@@ -200,8 +300,33 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("disconnect", () => {
-    console.log(`Player disconnected: ${socket.id}`);
+  socket.on("rejoinMatch", ({ matchId }, callback) => {
+    const match = activeMatches.get(matchId);
+    if (!match) {
+      return callback({ success: false, error: "Match not found" });
+    }
+
+    const player = match.players.find((p) => p.socketId === socket.id);
+    if (!player) {
+      return callback({ success: false, error: "Not part of this match" });
+    }
+
+    // Update socket reference
+    player.socketId = socket.id;
+    connectedPlayers.set(socket.id, player);
+
+    // Notify opponent
+    const opponent = player.opponent;
+    if (opponent && io.sockets.sockets.has(opponent.socketId)) {
+      io.to(opponent.socketId).emit("opponentReconnected");
+    }
+
+    callback({ success: true });
+  });
+
+  socket.on("disconnect", (reason) => {
+    clearInterval(heartbeatInterval);
+    console.log(`Player disconnected: ${socket.id} (Reason: ${reason})`);
     cleanupMatch(socket.id);
     removeFromQueue(socket.id);
     connectedPlayers.delete(socket.id);
