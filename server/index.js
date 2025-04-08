@@ -5,45 +5,129 @@ import cors from "cors";
 
 const app = express();
 const httpServer = createServer(app);
-
-// Configuration
-const PORT = process.env.PORT || 3001;
-const allowedOrigins = [
-  "https://pokeserver-beta.vercel.app",
-  "http://localhost:5173",
-];
-
-// Initialize Socket.io with enhanced settings
 const io = new Server(httpServer, {
   cors: {
-    origin: allowedOrigins,
+    origin: [
+      "https://pokeserver-beta.vercel.app",
+      "https://pokemon-fight-sandy.vercel.app",
+      "http://localhost:5173",
+    ],
     methods: ["GET", "POST"],
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
   },
   path: "/socket.io",
-  connectionStateRecovery: {
-    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
-    skipMiddlewares: true,
-  },
-  pingInterval: 10000, // Send ping every 10 seconds
-  pingTimeout: 5000, // Wait 5 seconds for pong response
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ["websocket", "polling"],
 });
 
-// Middleware
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: [
+      "https://pokeserver-beta.vercel.app",
+      "https://pokemon-fight-sandy.vercel.app",
+      "http://localhost:5173",
+    ],
     credentials: true,
   })
 );
 app.use(express.json());
 
-// Game state
+// Store connected players and queue
 const connectedPlayers = new Map();
 const queue = [];
 const activeMatches = new Map();
 
-// Helper functions
+// Basic routes
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    playersConnected: io.engine.clientsCount,
+    playersInQueue: queue.length,
+    activeMatches: activeMatches.size,
+    uptime: process.uptime(),
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy" });
+});
+
+io.on("connection", (socket) => {
+  console.log("Player connected:", socket.id);
+
+  // Handle heartbeat
+  socket.on("heartbeat", () => {
+    socket.emit("heartbeat_ack");
+  });
+
+  socket.on("joinQueue", (playerData) => {
+    const player = {
+      socketId: socket.id,
+      ...playerData,
+      lastActive: Date.now(),
+    };
+
+    // Remove player from queue if already in it
+    removeFromQueue(socket.id);
+
+    // Add player to queue
+    queue.push(player);
+    connectedPlayers.set(socket.id, player);
+
+    // Update all players with new queue status
+    io.emit("queueUpdate", {
+      position: queue.indexOf(player) + 1,
+      totalPlayers: queue.length,
+    });
+
+    // Check for match
+    checkForMatch();
+  });
+
+  socket.on("leaveQueue", () => {
+    removeFromQueue(socket.id);
+    connectedPlayers.delete(socket.id);
+    updateQueuePositions();
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Player disconnected:", socket.id);
+    handlePlayerDisconnect(socket.id);
+  });
+
+  socket.on("pokemonSelected", (data) => {
+    const match = findMatchByPlayerId(socket.id);
+    if (match) {
+      const opponent =
+        match.player1.socketId === socket.id ? match.player2 : match.player1;
+      io.to(opponent.socketId).emit("pokemonSelected", {
+        ...data,
+        username: connectedPlayers.get(socket.id)?.username,
+      });
+    }
+  });
+
+  socket.on("attack", (data) => {
+    const match = findMatchByPlayerId(socket.id);
+    if (match) {
+      const opponent =
+        match.player1.socketId === socket.id ? match.player2 : match.player1;
+      io.to(opponent.socketId).emit("attackPerformed", {
+        ...data,
+        username: connectedPlayers.get(socket.id)?.username,
+      });
+    }
+  });
+
+  // Send initial queue status
+  socket.emit("queueUpdate", {
+    position: queue.length,
+    totalPlayers: queue.length,
+  });
+});
+
 function removeFromQueue(socketId) {
   const index = queue.findIndex((player) => player.socketId === socketId);
   if (index !== -1) {
@@ -56,36 +140,54 @@ function updateQueuePositions() {
     io.to(player.socketId).emit("queueUpdate", {
       position: index + 1,
       totalPlayers: queue.length,
-      estimatedWaitTime: calculateWaitTime(index + 1),
     });
   });
 }
 
-function calculateWaitTime(position) {
-  // Simple estimation: average 30 seconds per position
-  return position * 30;
+function findMatchByPlayerId(socketId) {
+  for (const [matchId, match] of activeMatches) {
+    if (
+      match.player1.socketId === socketId ||
+      match.player2.socketId === socketId
+    ) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function handlePlayerDisconnect(socketId) {
+  const match = findMatchByPlayerId(socketId);
+  if (match) {
+    const opponent =
+      match.player1.socketId === socketId ? match.player2 : match.player1;
+    io.to(opponent.socketId).emit("opponentLeft");
+    activeMatches.delete(match.id);
+  }
+
+  removeFromQueue(socketId);
+  connectedPlayers.delete(socketId);
+  updateQueuePositions();
 }
 
 function checkForMatch() {
   if (queue.length >= 2) {
-    const [player1, player2] = queue.splice(0, 2);
+    const player1 = queue.shift();
+    const player2 = queue.shift();
 
-    // Set opponents
-    player1.opponent = player2;
-    player2.opponent = player1;
+    const matchId = `match_${Date.now()}_${player1.socketId}_${
+      player2.socketId
+    }`;
+    const match = {
+      id: matchId,
+      player1,
+      player2,
+      startTime: Date.now(),
+    };
 
-    // Update connected players
-    connectedPlayers.set(player1.socketId, player1);
-    connectedPlayers.set(player2.socketId, player2);
+    activeMatches.set(matchId, match);
 
-    // Create match record
-    const matchId = `${player1.socketId}-${player2.socketId}-${Date.now()}`;
-    activeMatches.set(matchId, {
-      players: [player1, player2],
-      startedAt: new Date().toISOString(),
-    });
-
-    // Notify players
+    // Notify both players
     io.to(player1.socketId).emit("matchFound", {
       matchId,
       opponent: {
@@ -104,120 +206,25 @@ function checkForMatch() {
       },
     });
 
+    // Update queue positions for remaining players
     updateQueuePositions();
   }
 }
 
-function cleanupMatch(socketId) {
-  const player = connectedPlayers.get(socketId);
-  if (player && player.opponent) {
-    const opponent = connectedPlayers.get(player.opponent.socketId);
-    if (opponent) {
-      io.to(opponent.socketId).emit("opponentLeft");
-      opponent.opponent = null;
-    }
-
-    // Remove match from active matches
-    for (const [matchId, match] of activeMatches.entries()) {
-      if (match.players.some((p) => p.socketId === socketId)) {
-        activeMatches.delete(matchId);
-        break;
-      }
+// Clean up inactive matches periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [matchId, match] of activeMatches) {
+    if (now - match.startTime > 30 * 60 * 1000) {
+      // 30 minutes timeout
+      io.to(match.player1.socketId).emit("matchTimeout");
+      io.to(match.player2.socketId).emit("matchTimeout");
+      activeMatches.delete(matchId);
     }
   }
-}
+}, 60000);
 
-// Routes
-app.get("/", (req, res) => {
-  res.json({
-    status: "online",
-    playersConnected: io.engine.clientsCount,
-    playersInQueue: queue.length,
-    activeMatches: activeMatches.size,
-    uptime: process.uptime(),
-    serverTime: new Date().toISOString(),
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// Socket.io events
-io.on("connection", (socket) => {
-  console.log(
-    `Player connected: ${socket.id} (Total: ${io.engine.clientsCount})`
-  );
-
-  // Heartbeat mechanism
-  socket.on("ping", (cb) => cb());
-
-  socket.on("joinQueue", (playerData) => {
-    if (!playerData.username || !playerData.rating) {
-      return socket.emit("error", "Missing required player data");
-    }
-
-    const player = {
-      socketId: socket.id,
-      joinedAt: new Date().toISOString(),
-      ...playerData,
-    };
-
-    removeFromQueue(socket.id);
-    queue.push(player);
-    connectedPlayers.set(socket.id, player);
-
-    updateQueuePositions();
-    checkForMatch();
-  });
-
-  socket.on("leaveQueue", () => {
-    removeFromQueue(socket.id);
-    connectedPlayers.delete(socket.id);
-    updateQueuePositions();
-  });
-
-  socket.on("pokemonSelected", (data) => {
-    const player = connectedPlayers.get(socket.id);
-    if (player?.opponent) {
-      io.to(player.opponent.socketId).emit("pokemonSelected", {
-        ...data,
-        username: player.username,
-      });
-    }
-  });
-
-  socket.on("attack", (data) => {
-    const player = connectedPlayers.get(socket.id);
-    if (player?.opponent) {
-      io.to(player.opponent.socketId).emit("attackPerformed", {
-        ...data,
-        username: player.username,
-      });
-    }
-  });
-
-  socket.on("disconnect", () => {
-    console.log(`Player disconnected: ${socket.id}`);
-    cleanupMatch(socket.id);
-    removeFromQueue(socket.id);
-    connectedPlayers.delete(socket.id);
-    updateQueuePositions();
-  });
-
-  // Initial queue status
-  socket.emit("queueUpdate", {
-    position: queue.length + 1,
-    totalPlayers: queue.length,
-    estimatedWaitTime: calculateWaitTime(queue.length + 1),
-  });
-});
-
-// Start server
+const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Allowed origins: ${allowedOrigins.join(", ")}`);
 });
