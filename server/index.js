@@ -23,16 +23,6 @@ app.use(
   })
 );
 
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-  next();
-});
-
 const io = new Server(httpServer, {
   cors: {
     origin: allowedOrigins,
@@ -52,6 +42,7 @@ const io = new Server(httpServer, {
 const connectedPlayers = new Map();
 const activeMatches = new Map();
 const queue = [];
+const playerMatches = new Map(); // Track which match each player is in
 
 // Middleware to handle connection timeouts
 io.use((socket, next) => {
@@ -59,7 +50,7 @@ io.use((socket, next) => {
   if (playerId) {
     socket.playerId = playerId;
     const existingSocket = connectedPlayers.get(playerId);
-    if (existingSocket) {
+    if (existingSocket && existingSocket.id !== socket.id) {
       existingSocket.disconnect();
       connectedPlayers.delete(playerId);
     }
@@ -70,6 +61,7 @@ io.use((socket, next) => {
 io.on("connection", (socket) => {
   console.log("Player connected:", socket.id);
 
+  // Heartbeat mechanism
   socket.on("heartbeat", () => {
     socket.emit("heartbeat_ack");
   });
@@ -98,6 +90,22 @@ io.on("connection", (socket) => {
       if (match.acknowledgedBy.size === 2) {
         io.to(match.player1.socketId).emit("matchConfirmed");
         io.to(match.player2.socketId).emit("matchConfirmed");
+        match.status = "active";
+      }
+    }
+  });
+
+  socket.on("rejoinMatch", ({ matchId }) => {
+    const match = activeMatches.get(matchId);
+    if (match) {
+      const player =
+        match.player1.socketId === socket.id ? match.player1 : match.player2;
+      if (player) {
+        socket.join(matchId);
+        io.to(matchId).emit("playerRejoined", {
+          playerId: player.socketId,
+          matchState: match.state,
+        });
       }
     }
   });
@@ -145,12 +153,15 @@ function handleDisconnect(socketId, reason) {
       });
     }
 
+    // Keep the match active for a while to allow reconnection
     setTimeout(() => {
       const updatedMatch = activeMatches.get(match.id);
-      if (updatedMatch && !updatedMatch.acknowledgedBy?.has(socketId)) {
+      if (updatedMatch && updatedMatch.status !== "active") {
         activeMatches.delete(match.id);
+        playerMatches.delete(socketId);
+        playerMatches.delete(opponent.socketId);
       }
-    }, 10000);
+    }, 30000);
   }
 
   removeFromQueue(socketId);
@@ -168,13 +179,9 @@ function updateQueueStatus() {
 }
 
 function findMatchByPlayerId(socketId) {
-  for (const [, match] of activeMatches) {
-    if (
-      match.player1.socketId === socketId ||
-      match.player2.socketId === socketId
-    ) {
-      return match;
-    }
+  const matchId = playerMatches.get(socketId);
+  if (matchId) {
+    return activeMatches.get(matchId);
   }
   return null;
 }
@@ -202,9 +209,16 @@ function checkForMatch() {
       player2,
       startTime: Date.now(),
       status: "pending",
+      state: {
+        player1Pokemon: null,
+        player2Pokemon: null,
+        currentTurn: "player1",
+      },
     };
 
     activeMatches.set(matchId, match);
+    playerMatches.set(player1.socketId, matchId);
+    playerMatches.set(player2.socketId, matchId);
 
     [player1, player2].forEach((player, index) => {
       const opponent = index === 0 ? player2 : player1;
@@ -226,13 +240,14 @@ setInterval(() => {
 
   // Clean up inactive matches
   for (const [matchId, match] of activeMatches) {
-    if (now - match.startTime > 5 * 60 * 1000) {
-      // 5 minutes timeout
+    if (now - match.startTime > 10 * 60 * 1000) {
+      // 10 minutes timeout
       const { player1, player2 } = match;
       [player1, player2].forEach((player) => {
         if (player && io.sockets.sockets.get(player.socketId)) {
           io.to(player.socketId).emit("matchTimeout");
         }
+        playerMatches.delete(player.socketId);
       });
       activeMatches.delete(matchId);
     }
